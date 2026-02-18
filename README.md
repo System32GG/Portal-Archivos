@@ -20,8 +20,8 @@ Una herramienta potente y sencilla en Python para compartir archivos entre tu PC
 
 1. **Clona el repositorio**:
    ```bash
-   git clone https://github.com/TU_USUARIO/TU_REPOSITORIO.git
-   cd TU_REPOSITORIO
+   git clone https://github.com/System32GG/Portal-Archivos.git
+   cd Portal-Archivos
    ```
 
 2. **Instala las dependencias**:
@@ -46,3 +46,4 @@ La aplicación solicita una contraseña la primera vez que se ejecuta. Esta cont
 ## 📄 Licencia
 
 Este proyecto está bajo la licencia MIT.
+
