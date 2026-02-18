@@ -1,4 +1,4 @@
-# 🗂️ Portal de Archivos Universal (Premium)
+# 🗂️ Portal de Archivos Universal
 
 Una herramienta potente y sencilla en Python para compartir archivos entre tu PC y otros dispositivos (Móviles, Tablets, otras PCs) a través de WiFi o Internet (vía Ngrok).
 
@@ -46,4 +46,5 @@ La aplicación solicita una contraseña la primera vez que se ejecuta. Esta cont
 ## 📄 Licencia
 
 Este proyecto está bajo la licencia MIT.
+
 
