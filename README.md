@@ -41,10 +41,15 @@ Una herramienta potente y sencilla en Python para compartir archivos entre tu PC
 
 ## 🔒 Seguridad
 
-La aplicación solicita una contraseña la primera vez que se ejecuta. Esta contraseña se guarda de forma segura (hasheada) en tu carpeta de configuraciones local. No se guardan contraseñas en texto plano.
+Medidas de seguridad básicas incluidas para uso personal:
+- Acceso protegido por contraseña con hasheo SHA-256.
+- Validación simple de rutas para limitar el acceso a las unidades del sistema.
+- Manejo de sesiones mediante cookies (atributos `HttpOnly` y `SameSite=Lax`).
+- La configuración se almacena localmente en la carpeta de usuario (`AppData`).
 
 ## 📄 Licencia
 
 Este proyecto está bajo la licencia MIT.
+
 
 
