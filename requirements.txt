@@ -1,3 +1,4 @@
 qrcode[pil]
 pyngrok
 Pillow
+cryptography
