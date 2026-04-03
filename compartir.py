@@ -10,6 +10,7 @@ import string
 import platform
 import sys
 import http.cookies
+import logging
 from datetime import datetime
 import urllib.request
 import webbrowser
@@ -122,14 +123,20 @@ NGROK_REGION = CONF["NGROK_REGION"]
 ACTIVE_SESSIONS = {} # {session_id: expiry_timestamp}
 LOGIN_ATTEMPTS = {}  # {ip: {'count': N, 'block_until': timestamp}}
 MAX_UPLOAD_SIZE = 2 * 1024 * 1024 * 1024 # 2GB por defecto
+# Token de solo lectura para visores externos (no expone el hash de la contraseña)
+VIEWER_TOKEN = secrets.token_urlsafe(32)
 
 # --- HELPERS ---
 
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
+
 def safe_print(msg):
-    try:
-        print(msg)
-    except UnicodeEncodeError:
-        print(msg.encode('ascii', 'ignore').decode('ascii'))
+    logger.info(msg)
 
 def get_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -219,7 +226,6 @@ def get_drives():
     else:
         drives.append("/")
     return drives
-    return drives
 
 def is_safe_path(path):
     """Valida que la ruta esté dentro de las unidades permitidas y resuelve '..'"""
@@ -258,7 +264,7 @@ class UniversalHandler(http.server.SimpleHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed_path.query)
         
         token = query.get('token', [None])[0]
-        if token == PASSWORD_HASH:
+        if token == VIEWER_TOKEN:
             return True
 
         # 2. Verificar Sesión mediante Cookie
@@ -268,11 +274,14 @@ class UniversalHandler(http.server.SimpleHTTPRequestHandler):
             if 'session_id' in cookie:
                 s_id = cookie['session_id'].value
                 if s_id in ACTIVE_SESSIONS:
-                    # Opcional: Verificar expiración
                     if time.time() < ACTIVE_SESSIONS[s_id]:
+                        # Limpiar sesiones expiradas de paso
+                        expired = [k for k, v in ACTIVE_SESSIONS.items() if v <= time.time()]
+                        for k in expired:
+                            del ACTIVE_SESSIONS[k]
                         return True
                     else:
-                        del ACTIVE_SESSIONS[s_id] # Sesión expirada
+                        del ACTIVE_SESSIONS[s_id]
         
         # Permitir el POST de login para procesarlo
         if self.path == "/login" and self.command == "POST":
@@ -366,8 +375,10 @@ class UniversalHandler(http.server.SimpleHTTPRequestHandler):
                     self.render_login_page(error_type="locked")
                     return
             
-            form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={'REQUEST_METHOD': 'POST'})
-            pw = form.getfirst("pw", "")
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length)
+            data = urllib.parse.parse_qs(body.decode('utf-8', errors='replace'))
+            pw = data.get('pw', [''])[0]
             
             if verify_password(pw, PASSWORD_HASH):
                 if not PASSWORD_HASH.startswith("pbkdf2:"):
@@ -377,7 +388,8 @@ class UniversalHandler(http.server.SimpleHTTPRequestHandler):
                     try:
                         with open(CONFIG_FILE, 'w') as f:
                             json.dump(CONF, f, indent=4)
-                    except: pass
+                    except Exception as e:
+                        logger.warning(f"No se pudo guardar el hash actualizado: {e}")
 
                 # Resetear intentos fallidos
                 if client_ip in LOGIN_ATTEMPTS: del LOGIN_ATTEMPTS[client_ip]
@@ -429,19 +441,45 @@ class UniversalHandler(http.server.SimpleHTTPRequestHandler):
                 environ={'REQUEST_METHOD': 'POST', 'CONTENT_TYPE': self.headers['Content-Type']}
             )
             
-            if "file" in form:
-                file_item = form["file"]
+            uploaded = []
+            failed = []
+
+            # Soportar múltiples archivos con el mismo campo "file"
+            file_items = form["file"] if "file" in form else []
+            if not isinstance(file_items, list):
+                file_items = [file_items]
+
+            for file_item in file_items:
                 if file_item.filename:
                     fn = os.path.basename(file_item.filename)
                     dest = os.path.join(target_dir, fn)
-                    with open(dest, 'wb') as f:
-                        f.write(file_item.file.read())
-                    message = f"✅ ¡{fn} subido con éxito!"
+                    CHUNK_SIZE = 1 * 1024 * 1024 # 1MB
+                    try:
+                        with open(dest, 'wb') as f:
+                            while True:
+                                chunk = file_item.file.read(CHUNK_SIZE)
+                                if not chunk:
+                                    break
+                                f.write(chunk)
+                        uploaded.append(fn)
+                        logger.info(f"Archivo subido: {dest}")
+                    except Exception as e:
+                        failed.append(fn)
+                        logger.warning(f"Error subiendo {fn}: {e}")
+
+            if uploaded and not failed:
+                if len(uploaded) == 1:
+                    message = f"✅ ¡{uploaded[0]} subido con éxito!"
                 else:
-                    message = "⚠️ No se seleccionó archivo."
+                    message = f"✅ ¡{len(uploaded)} archivos subidos con éxito!"
+            elif uploaded and failed:
+                message = f"⚠️ {len(uploaded)} subidos, {len(failed)} fallaron: {', '.join(failed)}"
+            elif failed:
+                message = f"❌ Error al subir: {', '.join(failed)}"
             else:
-                message = "❌ Error en el envío."
+                message = "⚠️ No se seleccionó ningún archivo."
         except Exception as e:
+            logger.error(f"Error en upload: {e}")
             message = f"❌ Error: {str(e)}"
 
         self.send_response(200)
@@ -469,13 +507,13 @@ class UniversalHandler(http.server.SimpleHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed_url.query)
             is_inline = query.get('inline', ['0'])[0] == '1'
             
+            CHUNK_SIZE = 1 * 1024 * 1024 # 1MB
             with open(path, 'rb') as f:
                 self.send_response(200)
                 self.send_header("Content-Type", content_type)
                 
                 # Si es inline, permitimos que el navegador lo muestre. 
                 # Si no, forzamos la descarga (attachment).
-                # NOTA: En móvil, incluir 'filename' en 'inline' a veces fuerza la descarga.
                 disposition = "inline" if is_inline else f'attachment; filename="{os.path.basename(path)}"'
                 
                 self.send_header("Content-Disposition", disposition)
@@ -487,8 +525,15 @@ class UniversalHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_header("Access-Control-Allow-Methods", "*")
                 self.send_security_headers()
                 self.end_headers()
-                self.wfile.write(f.read())
-        except Exception:
+                
+                # Streaming en bloques de 1MB
+                while True:
+                    chunk = f.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except Exception as e:
+            logger.warning(f"serve_file error en {path}: {e}")
             self.send_error(403, "Acceso denegado")
 
     def serve_zip(self, folder_path):
@@ -509,22 +554,27 @@ class UniversalHandler(http.server.SimpleHTTPRequestHandler):
                         arcname = os.path.relpath(file_path, folder_path)
                         zf.write(file_path, arcname)
             
-            # Servir el archivo
-            with open(tmp_path, 'rb') as f:
-                content = f.read()
-                
+            # Servir el archivo en bloques (Streaming)
+            CHUNK_SIZE = 1 * 1024 * 1024 # 1MB
             self.send_response(200)
             self.send_header("Content-Type", "application/zip")
             self.send_header("Content-Disposition", f'attachment; filename="{zip_filename}"')
-            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Content-Length", str(os.path.getsize(tmp_path)))
             self.send_security_headers()
             self.end_headers()
-            self.wfile.write(content)
+
+            with open(tmp_path, 'rb') as f:
+                while True:
+                    chunk = f.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
             
             # Limpiar temporal
             os.remove(tmp_path)
             
         except Exception as e:
+            logger.error(f"serve_zip error: {e}")
             self.send_error(500, f"Error al crear ZIP: {e}")
 
     def get_common_css(self):
@@ -988,61 +1038,90 @@ class UniversalHandler(http.server.SimpleHTTPRequestHandler):
 
             function uploadFile() {
                 const fileInput = document.getElementById('file-upload');
-                const file = fileInput.files[0];
-                if (!file) {
-                    alert("Por favor selecciona un archivo primero.");
+                const files = Array.from(fileInput.files);
+                if (files.length === 0) {
+                    alert("Por favor seleccioná al menos un archivo.");
                     return;
                 }
 
-                const formData = new FormData();
-                formData.append('file', file);
-
-                const xhr = new XMLHttpRequest();
                 const progressContainer = document.getElementById('progress-container');
                 const progressBar = document.getElementById('progress-bar');
                 const uploadBtn = document.getElementById('upload-btn');
-                
+                const statusLabel = document.getElementById('upload-status');
+
                 uploadBtn.disabled = true;
-                uploadBtn.innerText = "Subiendo... 0%";
                 progressContainer.style.display = 'block';
+                progressBar.style.backgroundColor = 'var(--accent)';
 
-                xhr.upload.onprogress = function(event) {
-                    if (event.lengthComputable) {
-                        const percentComplete = (event.loaded / event.total) * 100;
-                        const percentStr = Math.round(percentComplete) + '%';
-                        progressBar.style.width = percentStr;
-                        progressBar.textContent = percentStr;
-                        uploadBtn.innerText = `Subiendo... ${percentStr}`;
-                    }
-                };
-
-                xhr.onload = function() {
-                    if (xhr.status == 200) {
-                        uploadBtn.innerText = "¡Subida completada!";
-                        progressBar.style.backgroundColor = "#4CAF50";
-                        setTimeout(() => {
-                            window.location.reload();
-                        }, 500);
-                    } else {
-                        alert("Error al subir el archivo.");
-                        uploadBtn.disabled = false;
-                        uploadBtn.innerText = "Subir al Servidor";
-                        progressContainer.style.display = 'none';
-                    }
-                };
-
-                xhr.onerror = function() {
-                    alert("Error de red al subir el archivo.");
-                    uploadBtn.disabled = false;
-                    uploadBtn.innerText = "Subir al Servidor";
-                    progressContainer.style.display = 'none';
-                };
-
-                // Normalizar URL actual para el POST
                 const urlParams = new URLSearchParams(window.location.search);
                 const path = urlParams.get('p') || '';
-                xhr.open('POST', '/?p=' + encodeURIComponent(path), true);
-                xhr.send(formData);
+                const uploadUrl = '/?p=' + encodeURIComponent(path);
+
+                let completed = 0;
+                let failed = 0;
+
+                function uploadNext(index) {
+                    if (index >= files.length) {
+                        // Todos terminados
+                        const total = files.length;
+                        if (failed === 0) {
+                            uploadBtn.innerText = total === 1 ? "¡Subida completada!" : `¡${total} archivos subidos!`;
+                            progressBar.style.backgroundColor = "#4CAF50";
+                            progressBar.style.width = "100%";
+                            progressBar.textContent = "100%";
+                        } else {
+                            uploadBtn.innerText = `${completed} OK, ${failed} fallaron`;
+                            progressBar.style.backgroundColor = "#FF9500";
+                        }
+                        if (statusLabel) statusLabel.textContent = '';
+                        setTimeout(() => window.location.reload(), 800);
+                        return;
+                    }
+
+                    const file = files[index];
+                    if (statusLabel) {
+                        statusLabel.textContent = files.length > 1
+                            ? `Subiendo ${index + 1}/${files.length}: ${file.name}`
+                            : `Subiendo: ${file.name}`;
+                    }
+
+                    const formData = new FormData();
+                    formData.append('file', file);
+
+                    const xhr = new XMLHttpRequest();
+
+                    xhr.upload.onprogress = function(event) {
+                        if (event.lengthComputable) {
+                            // Progreso total considerando archivos previos
+                            const fileProgress = event.loaded / event.total;
+                            const totalPercent = Math.round(((index + fileProgress) / files.length) * 100);
+                            progressBar.style.width = totalPercent + '%';
+                            progressBar.textContent = totalPercent + '%';
+                            uploadBtn.innerText = `Subiendo... ${totalPercent}%`;
+                        }
+                    };
+
+                    xhr.onload = function() {
+                        if (xhr.status === 200) {
+                            completed++;
+                        } else {
+                            failed++;
+                            console.error(`Error subiendo ${file.name}: HTTP ${xhr.status}`);
+                        }
+                        uploadNext(index + 1);
+                    };
+
+                    xhr.onerror = function() {
+                        failed++;
+                        console.error(`Error de red subiendo ${file.name}`);
+                        uploadNext(index + 1);
+                    };
+
+                    xhr.open('POST', uploadUrl, true);
+                    xhr.send(formData);
+                }
+
+                uploadNext(0);
             }
             
             if (document.readyState === 'loading') {
@@ -1052,7 +1131,7 @@ class UniversalHandler(http.server.SimpleHTTPRequestHandler):
             }
         </script>
         """
-        return js_code.replace("PASSWORD_HERE", PASSWORD_HASH)
+        return js_code.replace("PASSWORD_HERE", VIEWER_TOKEN)
 
     def get_quick_access(self):
         home = os.path.expanduser("~")
@@ -1143,8 +1222,9 @@ class UniversalHandler(http.server.SimpleHTTPRequestHandler):
                 <div class="upload-box">
                     <h3>📤 Subir a esta carpeta</h3>
                     <div style="margin-bottom:15px;">
-                        <input type="file" id="file-upload" name="file" style="width:100%;">
+                        <input type="file" id="file-upload" name="file" multiple style="width:100%;">
                     </div>
+                    <div id="upload-status" style="font-size:0.85rem; color:rgba(255,255,255,0.8); min-height:1.2em; margin-bottom:8px;"></div>
                     <button id="upload-btn" onclick="uploadFile()" class="btn">Subir al Servidor</button>
                     <div id="progress-container" class="progress-container">
                         <div id="progress-bar" class="progress-bar">0%</div>
@@ -1201,7 +1281,7 @@ class UniversalHandler(http.server.SimpleHTTPRequestHandler):
                     mtime = os.path.getmtime(full)
                 else:
                     try: mtime = os.path.getmtime(full)
-                    except: pass
+                    except Exception: pass
 
                 # Categoría para filtro
                 ext = os.path.splitext(full)[1].lower()
@@ -1222,7 +1302,9 @@ class UniversalHandler(http.server.SimpleHTTPRequestHandler):
                     "cat": cat,
                     "preview_btn": self.get_preview_button(full, item) if not is_dir else f'<a href="{url}&zip=1" style="text-decoration:none; font-size:20px; padding:15px;" title="Descargar como ZIP">📦</a>'
                 })
-            except: continue
+            except Exception as e:
+                logger.warning(f"Error procesando item '{item}': {e}")
+                continue
         
         # Inyectar JSON de forma segura en un bloque script (para no romper el HTML con comillas)
         import json
@@ -1264,13 +1346,6 @@ class UniversalHandler(http.server.SimpleHTTPRequestHandler):
             url = f"/?p={urllib.parse.quote(path)}"
             return f'<button onclick="previewFile(\'{url}\', \'{type_map[ext]}\', \'{name}\')" style="background:none; border:none; font-size:20px; cursor:pointer; padding:15px;" title="Vista rápida">👁️</button>'
         return ""
-
-        self.send_response(200)
-        self.send_header("Content-type", "text/html; charset=utf-8")
-        self.send_security_headers()
-        self.end_headers()
-        self.wfile.write(self.render_msg(msg, path).encode('utf-8'))
-        return "" # No necesario pero por claridad
 
     def render_msg(self, msg, path):
         return f"""
@@ -1437,10 +1512,7 @@ def run_server():
         root.protocol("WM_DELETE_WINDOW", lambda: sys.exit(0))
         root.mainloop()
 
-    # Redirigir stdout/stderr para evitar ventana CMD si no hay consola
-    if not sys.stdin or not sys.stdin.isatty():
-        sys.stdout = open(os.devnull, 'w')
-        sys.stderr = open(os.devnull, 'w')
+    # No redirigir stdout — usamos logging que ya maneja esto correctamente
 
     if url_final != url_local:
         # Mostrar QR en consola por si acaso
@@ -1448,7 +1520,8 @@ def run_server():
             qr_remoto = qrcode.QRCode(version=1, box_size=1, border=1)
             qr_remoto.add_data(url_final)
             qr_remoto.print_ascii()
-        except: pass
+        except Exception as e:
+            logger.warning(f"No se pudo mostrar QR remoto: {e}")
     
     # Iniciar el servidor en un hilo secundario para que no bloquee la GUI
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -1476,7 +1549,8 @@ def run_server():
                 from pyngrok import ngrok
                 ngrok.disconnect(url_final)
                 ngrok.kill()
-            except: pass
+            except Exception as e:
+                logger.warning(f"Error cerrando ngrok: {e}")
         httpd.server_close()
 
 if __name__ == "__main__":
